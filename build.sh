@@ -9,11 +9,14 @@
 #  What it does:
 #    1. Copy the stock image (COW if possible) -> <out>.img  (original kept!)
 #    2. Patch the ARM64 kernel cmdline (KERN-A) to:
-#         - boot ROOT-A directly (no dm-verity, rw)
+#         - boot ROOT-A directly (no dm-verity, rw  — clears the stock
+#           ro-compat ext4 features, which is why we rebuild the fs)
 #         - run init=/toolkit/toolkit.sh (our TUI)
-#    3. Reformat ROOT-A as clean, writable ext4 (the stock fs refuses rw due
-#       to ChromeOS ro-compat ext4 features like fs-verity) and seed it from
-#       the stock rootfs, then install /toolkit.
+#    3. Rebuild ROOT-A as clean, writable ext4: extract the stock userland,
+#       add /toolkit, and write it back into the partition image.
+#
+#  NO loop devices and NO mounting required — pure userspace (e2fsprogs +
+#  python3), so it builds even in containers/Crostini that have no /dev/loop*.
 #
 #  REQUIRES signature verification to be OFF on the target device
 #  (dev mode / custom firmware), otherwise the patched kernel won't boot.
@@ -32,7 +35,8 @@ ROOT_A_START=$((1454080))             # p3 ChromeOS rootfs (ROOT-A)
 ROOT_A_END=$((9842687))               # exclusive span -> size
 KERN_A_OFF=$((KERN_A_START * SECTOR))
 ROOT_A_OFF=$((ROOT_A_START * SECTOR))
-ROOT_A_SIZE=$(((ROOT_A_END - ROOT_A_START + 1) * SECTOR))
+ROOT_A_BLOCKS=$((ROOT_A_END - ROOT_A_START + 1))     # in 512-byte sectors
+ROOT_A_SIZE=$((ROOT_A_BLOCKS * SECTOR))
 
 # Offset of the kernel cmdline *inside* the KERN-A blob (found via inspection)
 CMDLINE_IN_KERN=42799104
@@ -48,14 +52,15 @@ warn(){ printf '\033[1;33m[!] %s\033[0m\n' "$*"; }
 die(){  printf '\033[1;31m[x] %s\033[0m\n' "$*"; exit 1; }
 
 need(){ command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
-for t in cp mount umount losetup python3 mkfs.ext4 rsync e2fsck; do need "$t"; done
+for t in cp dd truncate mkfs.ext4 debugfs python3 rm mkdir; do need "$t"; done
 
 [ -f "$SRC" ] || die "source image not found: $SRC"
-id -u | grep -q '^0$' || die "run as root (need loop mounts) — try: sudo ./build.sh"
+# root is NOT required (we don't mount), but warn if loop tools are missing
+id -u | grep -q '^0$' || warn "not root (fine: we don't mount, only write files)"
 
-cleanup(){ umount "$MNT_NEW" 2>/dev/null || true; umount "$MNT_SRC" 2>/dev/null || true; \
-           losetup -d "$LOOP_NEW" 2>/dev/null || true; losetup -d "$LOOP_SRC" 2>/dev/null || true; \
-           rmdir "$MNT_NEW" "$MNT_SRC" 2>/dev/null || true; }
+OUTDIR="$(dirname "$OUT")"; [ "$OUTDIR" = "." ] && OUTDIR="$PWD"
+WORK="$(mktemp -d "$OUTDIR/.build-tmp.XXXXXX" 2>/dev/null || mktemp -d)"
+cleanup(){ rm -rf "$WORK"; }
 trap cleanup EXIT
 
 # ---- 1. copy ----------------------------------------------------------------
@@ -76,37 +81,34 @@ with open(img, 'r+b') as f:
 print('  -> ' + cmd)
 PY
 
-# ---- 3. reformat ROOT-A as clean ext4 + seed + install toolkit --------------
-MNT_SRC=$(mktemp -d); MNT_NEW=$(mktemp -d)
+# ---- 3. rebuild ROOT-A as clean writable ext4 (loop-free) -------------------
+STOCK_FS="$WORK/stock-rootfs.img"
+NEW_FS="$WORK/rootfs-new.img"
+STAGE="$WORK/rootfs"
 
-info "Preparing clean ext4 for ROOT-A (${ROOT_A_SIZE} bytes)..."
-LOOP_NEW=$(losetup -f --show -o "$ROOT_A_OFF" --sizelimit "$ROOT_A_SIZE" "$OUT")
-mkfs.ext4 -q -F -L ROOT-A "$LOOP_NEW"
+info "Extracting stock ROOT-A partition (${ROOT_A_SIZE} bytes) to a standalone image..."
+dd if="$OUT" of="$STOCK_FS" bs=${SECTOR} skip=$((ROOT_A_OFF / SECTOR)) count="$ROOT_A_BLOCKS" status=none
 
-info "Mounting stock ROOT-A (ro) and new ROOT-A (rw) ..."
-LOOP_SRC=$(losetup -f --show -o "$ROOT_A_OFF" --sizelimit "$ROOT_A_SIZE" "$SRC")
-mount -o ro "$LOOP_SRC" "$MNT_SRC"
-mount -o rw "$LOOP_NEW" "$MNT_NEW"
-
-info "Seeding toolkit rootfs from stock ChromeOS userland (this takes a bit)..."
-rsync -aHAX \
-    --exclude='/proc/*' --exclude='/sys/*' --exclude='/dev/*' --exclude='/run/*' \
-    --exclude='/tmp/*'  --exclude='/mnt/*' --exclude='/media/*' --exclude='/lost+found' \
-    "$MNT_SRC/" "$MNT_NEW/"
-mkdir -p "$MNT_NEW"/{proc,sys,dev/pts,run,tmp,mnt,media}
+info "Unpacking the entire stock userland to a staging dir (debugfs rdump)..."
+mkdir -p "$STAGE"
+debugfs -R 'rdump /' "$STOCK_FS" "$STAGE" 2>/dev/null
 
 info "Installing toolkit into rootfs..."
-rm -rf "$MNT_NEW/toolkit"
-cp -a "$TOOLKIT_DIR" "$MNT_NEW/toolkit"
-chmod 755 "$MNT_NEW/toolkit/toolkit.sh"
-chmod -R a+rX "$MNT_NEW/toolkit"
-[ -x "$MNT_NEW/bin/bash" ] || die "rootfs has no /bin/bash!"
+rm -rf "$STAGE/toolkit"
+cp -a "$TOOLKIT_DIR" "$STAGE/toolkit"
+chmod 755 "$STAGE/toolkit/toolkit.sh"
+chmod -R a+rX "$STAGE/toolkit"
+[ -x "$STAGE/bin/bash" ] || die "rootfs has no /bin/bash!"
 
+info "Creating clean writable ext4 for ROOT-A and populating it (-d staging dir)..."
+truncate -s "$ROOT_A_SIZE" "$NEW_FS"
+mkfs.ext4 -q -F -L ROOT-A -d "$STAGE" "$NEW_FS"
+
+info "Splicing new ROOT-A into the output image at byte $ROOT_A_OFF..."
+dd if="$NEW_FS" of="$OUT" bs=${SECTOR} seek=$((ROOT_A_OFF / SECTOR)) conv=notrunc status=none
 sync
-umount "$MNT_NEW"; umount "$MNT_SRC"
-losetup -d "$LOOP_NEW"; losetup -d "$LOOP_SRC"
-rmdir "$MNT_NEW" "$MNT_SRC"
-trap - EXIT
+
+rm -rf "$WORK"; trap - EXIT
 
 echo
 info "Done. Wrote: $OUT ($(du -h "$OUT" | cut -f1))"

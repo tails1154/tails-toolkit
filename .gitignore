@@ -10,3 +10,4 @@ chromeos_*.bin.zip
 
 # Scratch
 work/
+.build-tmp.*/
