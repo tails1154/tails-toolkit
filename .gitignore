@@ -1,0 +1,12 @@
+# Build output
+tails-toolkit*.img
+*.img
+
+# Stock ~8GB recovery image (source for build.sh; never commit)
+chromeos_*.bin
+chromeos_*.bin.zip
+*.bin
+*.bin.zip
+
+# Scratch
+work/
