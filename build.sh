@@ -91,7 +91,8 @@ dd if="$OUT" of="$STOCK_FS" bs=${SECTOR} skip=$((ROOT_A_OFF / SECTOR)) count="$R
 
 info "Unpacking the entire stock userland to a staging dir (debugfs rdump)..."
 mkdir -p "$STAGE"
-debugfs -R 'rdump /' "$STOCK_FS" "$STAGE" 2>/dev/null
+# NOTE: rdump's destination must live INSIDE the -R string, not as a positional arg.
+debugfs -R "rdump / \"$STAGE\"" "$STOCK_FS" 2>/dev/null
 
 info "Installing toolkit into rootfs..."
 rm -rf "$STAGE/toolkit"
@@ -101,6 +102,9 @@ chmod -R a+rX "$STAGE/toolkit"
 [ -x "$STAGE/bin/bash" ] || die "rootfs has no /bin/bash!"
 
 info "Creating clean writable ext4 for ROOT-A and populating it (-d staging dir)..."
+# mke2fs -d runs as the current user; ensure it can read every staged file
+# (stock files may carry root-only modes). Ownership reset to root is fine.
+chmod -R a+rX "$STAGE"
 truncate -s "$ROOT_A_SIZE" "$NEW_FS"
 mkfs.ext4 -q -F -L ROOT-A -d "$STAGE" "$NEW_FS"
 
